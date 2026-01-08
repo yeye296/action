@@ -107,12 +107,12 @@ class PellaAutoRenew:
         )
 
     def extract_expiry_days(self, page_source):
-        match = re.search(r"Your server expires in\s*(\d+)D\s*(\d+)H\s*(\d+)M", page_source)
+        match = re.search(r"Your server is expiring in\s*(\d+)Days\s*(\d+)Hours\s*(\d+)Minutes", page_source)
         if match:
             d, h, m = int(match.group(1)), int(match.group(2)), int(match.group(3))
             return f"{d}天{h}时{m}分", d + h/24 + m/1440
             
-        match = re.search(r"Your server expires in\s*(\d+)D", page_source)
+        match = re.search(r"Your server is expiring in\s*(\d+)Days", page_source)
         if match:
             d = int(match.group(1))
             return f"{d}天", float(d)
@@ -297,7 +297,8 @@ class PellaAutoRenew:
         logger.info(f"📅 当前过期: {self.initial_expiry_details}")
 
         if self.initial_expiry_value == -1.0:
-            raise Exception("❌ 无法提取过期时间")
+            logger.info(f"❌ 无法提取过期时间")
+            #raise Exception("❌ 无法提取过期时间")
 
         try:
             selector = "a[href*='/renew/']:not(.opacity-50):not(.pointer-events-none)"
