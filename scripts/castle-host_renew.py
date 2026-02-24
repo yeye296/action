@@ -76,12 +76,13 @@ def ensure_output_dir():
 
 def screenshot_path(account_idx: int, server_id: str, stage: str) -> str:
     timestamp = datetime.now().strftime("%H%M%S")
-    filename = f"acc{account_idx + 1}_{server_id}_{stage}_{timestamp}.png"
+    masked = mask_id(server_id)
+    filename = f"acc{account_idx + 1}_{masked}_{stage}_{timestamp}.png"
     return str(OUTPUT_DIR / filename)
 
 
 def mask_id(sid: str) -> str:
-    return f"{sid[0]}***{sid[-2:]}" if len(sid) > 3 else sid
+    return f"{sid[0]}***{sid[-2:]}" if len(sid) > 3 else "***"
 
 
 def convert_date(s: str) -> str:
@@ -106,19 +107,6 @@ def parse_cookies(s: str) -> List[Dict]:
     return cookies
 
 
-def analyze_error(msg: str) -> Tuple[RenewalStatus, str]:
-    m = msg.lower()
-    if "24 час" in m or "уже продлен" in m or "24 hour" in m:
-        return RenewalStatus.RATE_LIMITED, "今日已续期(24小时限制)"
-    if "недостаточно" in m or "insufficient" in m:
-        return RenewalStatus.FAILED, "余额不足"
-    if "vksub" in m.lower():
-        return RenewalStatus.FAILED, "需要加入VK群组"
-    if "валидации" in m or "validation" in m:
-        return RenewalStatus.FAILED, "CSRF验证失败"
-    return RenewalStatus.FAILED, msg
-
-
 class Notifier:
     def __init__(self, token: Optional[str], chat_id: Optional[str]):
         self.token, self.chat_id = token, chat_id
@@ -126,10 +114,8 @@ class Notifier:
     async def send_photo(self, caption: str, photo_path: str) -> Optional[int]:
         if not self.token or not self.chat_id:
             return None
-        
         if not photo_path or not Path(photo_path).exists():
             return await self.send(caption)
-        
         try:
             async with aiohttp.ClientSession() as session:
                 url = f"https://api.telegram.org/bot{self.token}/sendPhoto"
@@ -142,8 +128,7 @@ class Notifier:
                         if r.status == 200:
                             logger.info("✅ 通知已发送（带截图）")
                             return (await r.json()).get('result', {}).get('message_id')
-                        else:
-                            return await self.send(caption)
+                        return await self.send(caption)
         except Exception as e:
             logger.error(f"❌ 通知异常: {e}")
             return await self.send(caption)
@@ -210,15 +195,17 @@ class CastleClient:
         try:
             path = screenshot_path(self.account_idx, server_id, stage)
             await self.page.screenshot(path=path, full_page=True)
-            logger.info(f"📸 截图已保存")
+            logger.info("📸 截图已保存")
             return path
         except Exception as e:
             logger.error(f"❌ 截图失败: {e}")
             return ""
 
     async def get_server_ids(self) -> List[str]:
+        """从服务器列表页获取服务器ID"""
         try:
             await self.page.goto(f"{self.BASE}/servers", wait_until="networkidle")
+            await self.page.wait_for_timeout(2000)
             match = re.search(r'var\s+ServersID\s*=\s*\[([\d,\s]+)\]', await self.page.content())
             if match:
                 ids = [x.strip() for x in match.group(1).split(",") if x.strip()]
@@ -228,171 +215,165 @@ class CastleClient:
             logger.error(f"❌ 获取服务器ID失败: {e}")
         return []
 
-    async def check_server_running(self) -> bool:
-        """检查服务器是否运行中"""
+    async def check_server_stopped(self, sid: str) -> bool:
+        """检查服务器是否关机（在 /servers 页面）"""
         try:
-            # 方法1: 检查状态文本 "Сервер запущен"
-            running_text = self.page.locator('.shard-value:has-text("Сервер запущен")')
-            if await running_text.count() > 0:
+            start_btn = self.page.locator(f'button.icon-server-bstop[onclick*="sendAction({sid},\'start\')"]')
+            if await start_btn.count() > 0:
                 return True
-            
-            # 方法2: 检查绿色状态图标
-            green_icon = self.page.locator('i.bi-hdd-stack.text-success')
-            if await green_icon.count() > 0:
-                return True
-            
-            # 方法3: 检查是否有启动按钮（有则说明未运行）
-            start_btn = self.page.locator('a.btn-control:has-text("Запустить")')
-            if await start_btn.count() > 0 and await start_btn.is_visible():
-                return False
-            
-            return True  # 默认认为运行中
+            return False
         except:
-            return True
+            return False
 
-    async def start_if_stopped(self, sid: str) -> bool:
-        """进入控制页，如果服务器关机则启动"""
+    async def start_server_via_api(self, sid: str) -> bool:
+        """通过调用JS函数启动服务器"""
         masked = mask_id(sid)
         try:
-            await self.page.goto(f"{self.BASE}/servers/control/index/{sid}", wait_until="networkidle")
-            await self.page.wait_for_timeout(2000)
+            if "/servers" not in self.page.url or "/control" in self.page.url or "/pay" in self.page.url:
+                await self.page.goto(f"{self.BASE}/servers", wait_until="networkidle")
+                await self.page.wait_for_timeout(2000)
 
-            # 检查是否已运行
-            if await self.check_server_running():
-                logger.info(f"✅ 服务器 {masked} 运行中")
+            if not await self.check_server_stopped(sid):
+                logger.info(f"✅ 服务器 {masked} 已在运行")
                 return False
 
-            # 服务器未运行，尝试启动
             logger.info(f"🔴 服务器 {masked} 已关机，正在启动...")
-            
-            # 使用页面内 JavaScript 发送启动请求
-            result = await self.page.evaluate(f"""
-                async () => {{
-                    try {{
-                        const token = document.querySelector('meta[name="csrf-token"]')?.content;
-                        if (!token) return {{ success: false, error: 'No CSRF token' }};
-                        
-                        const response = await fetch('/servers/control/action/{sid}/start', {{
-                            method: 'POST',
-                            headers: {{
-                                'X-CSRF-TOKEN': token,
-                                'X-Requested-With': 'XMLHttpRequest',
-                                'Accept': 'application/json'
-                            }}
-                        }});
-                        const data = await response.json();
-                        return {{ success: true, data: data }};
-                    }} catch (e) {{
-                        return {{ success: false, error: e.message }};
-                    }}
-                }}
-            """)
-            
-            if result.get('success'):
-                await self.page.wait_for_timeout(5000)
-                logger.info(f"🟢 服务器 {masked} 启动指令已发送")
+
+            response_data = {}
+
+            async def handle_response(response):
+                if "/servers/control/action/" in response.url and "/start" in response.url:
+                    try:
+                        response_data['result'] = await response.json()
+                        logger.info(f"📡 启动API响应: {response_data['result']}")
+                    except:
+                        try:
+                            response_data['text'] = await response.text()
+                        except:
+                            pass
+
+            self.page.on("response", handle_response)
+
+            logger.info(f"🔄 发送启动指令...")
+            await self.page.evaluate(f"sendAction({sid}, 'start')")
+
+            await self.page.wait_for_timeout(5000)
+
+            self.page.remove_listener("response", handle_response)
+
+            result = response_data.get('result', {})
+            if result.get('status') == 'success':
+                logger.info(f"🟢 服务器 {masked} 启动成功")
+                await self.page.wait_for_timeout(3000)
+                await self.page.goto(f"{self.BASE}/servers", wait_until="networkidle")
+                await self.page.wait_for_timeout(2000)
                 return True
+            elif result.get('status') == 'error':
+                logger.warning(f"⚠️ 启动失败: {result.get('error', '未知错误')}")
+                return False
             else:
-                logger.error(f"❌ 启动失败: {result.get('error')}")
-                # 尝试点击按钮作为备选
-                start_btn = self.page.locator('a.btn-control:has-text("Запустить")').first
-                if await start_btn.count() > 0:
-                    await start_btn.click()
-                    await self.page.wait_for_timeout(5000)
-                    logger.info(f"🟢 服务器 {masked} 启动指令已发送(点击)")
+                text = response_data.get('text', '')
+                if 'success' in text.lower():
+                    logger.info(f"🟢 服务器 {masked} 启动指令已发送")
+                    await self.page.wait_for_timeout(3000)
+                    await self.page.goto(f"{self.BASE}/servers", wait_until="networkidle")
+                    await self.page.wait_for_timeout(2000)
                     return True
+                logger.warning(f"⚠️ 启动响应未知")
+                return False
 
         except Exception as e:
             logger.error(f"❌ 启动服务器 {masked} 失败: {e}")
         return False
 
-    async def get_expiry(self, sid: str) -> str:
-        """获取到期时间"""
-        try:
-            await self.page.goto(f"{self.BASE}/servers/pay/index/{sid}", wait_until="networkidle")
-            await self.page.wait_for_timeout(1500)
-            
-            content = await self.page.text_content("body")
-            match = re.search(r"(\d{2}\.\d{2}\.\d{4})", content)
-            return match.group(1) if match else ""
-        except Exception as e:
-            logger.error(f"❌ 获取到期时间失败: {e}")
-            return ""
-
-    async def renew(self, sid: str) -> Tuple[RenewalStatus, str, str]:
-        """续约服务器 - 使用页面内 JavaScript 执行"""
+    async def renew(self, sid: str) -> Tuple[RenewalStatus, str, str, str, int]:
+        """续约服务器"""
         masked = mask_id(sid)
         screenshot_file = ""
-        
+        expiry = ""
+        days = 0
+
         try:
-            # 确保在 pay 页面
-            current_url = self.page.url
-            if f"/pay/index/{sid}" not in current_url:
-                await self.page.goto(f"{self.BASE}/servers/pay/index/{sid}", wait_until="networkidle")
-                await self.page.wait_for_timeout(1500)
-            
-            # 使用页面内 JavaScript 发送续约请求（自动携带正确的 cookies 和 headers）
-            result = await self.page.evaluate(f"""
-                async () => {{
-                    try {{
-                        const token = document.querySelector('meta[name="csrf-token"]')?.content;
-                        if (!token) return {{ success: false, error: 'No CSRF token found' }};
-                        
-                        const response = await fetch('/servers/pay/buy_months/{sid}', {{
-                            method: 'POST',
-                            headers: {{
-                                'X-CSRF-TOKEN': token,
-                                'X-Requested-With': 'XMLHttpRequest',
-                                'Accept': 'application/json, text/javascript, */*; q=0.01',
-                                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
-                            }},
-                            credentials: 'same-origin'
-                        }});
-                        
-                        const data = await response.json();
-                        return {{ success: true, status: response.status, data: data }};
-                    }} catch (e) {{
-                        return {{ success: false, error: e.message }};
-                    }}
-                }}
-            """)
-            
+            logger.info(f"📄 访问续约页面...")
+            await self.page.goto(f"{self.BASE}/servers/pay/index/{sid}", wait_until="networkidle")
+            await self.page.wait_for_timeout(2000)
+
+            content = await self.page.text_content("body")
+            match = re.search(r"(\d{2}\.\d{2}\.\d{4})", content)
+            if match:
+                expiry = match.group(1)
+                days = days_left(expiry)
+                logger.info(f"📅 到期: {convert_date(expiry)} ({days}天)")
+
+            renew_btn = self.page.locator('#freebtn')
+            if await renew_btn.count() == 0:
+                logger.error(f"❌ 找不到续约按钮")
+                screenshot_file = await self.take_screenshot(sid, "no_button")
+                return RenewalStatus.FAILED, "找不到续约按钮", screenshot_file, expiry, days
+
+            response_data = {}
+
+            async def handle_response(response):
+                if "/servers/pay/buy_months/" in response.url:
+                    try:
+                        response_data['result'] = await response.json()
+                    except:
+                        pass
+
+            self.page.on("response", handle_response)
+
             logger.info(f"🖱️ 服务器 {masked} 已请求续约")
-            
-            if not result.get('success'):
-                error_msg = result.get('error', '请求失败')
-                logger.error(f"❌ 请求失败: {error_msg}")
-                screenshot_file = await self.take_screenshot(sid, "error")
-                return RenewalStatus.FAILED, error_msg, screenshot_file
-            
-            data = result.get('data', {})
-            
-            # 刷新页面获取最新状态
-            await self.page.reload(wait_until="networkidle")
-            await self.page.wait_for_timeout(1000)
-            
-            if data.get("status") == "error":
-                error_msg = data.get("error", "未知错误")
-                status, msg = analyze_error(error_msg)
-                stage = "limited" if status == RenewalStatus.RATE_LIMITED else "failed"
-                logger.info(f"📝 结果: {msg}")
-                screenshot_file = await self.take_screenshot(sid, stage)
-                return status, msg, screenshot_file
-            
+            await renew_btn.click()
+
+            await self.page.wait_for_timeout(3000)
+
+            self.page.remove_listener("response", handle_response)
+
+            data = response_data.get('result', {})
+
             if data.get("status") == "success":
                 logger.info(f"📝 结果: ✅ 续约成功")
+                await self.page.wait_for_timeout(1000)
                 screenshot_file = await self.take_screenshot(sid, "success")
-                return RenewalStatus.SUCCESS, "续约成功", screenshot_file
-            
-            # 未知响应
-            logger.info(f"📝 结果: 未知响应 {data}")
+                return RenewalStatus.SUCCESS, "续约成功", screenshot_file, expiry, days
+
+            success_toast = self.page.locator('.iziToast-message:has-text("Успешно")')
+            if await success_toast.count() > 0:
+                logger.info(f"📝 结果: ✅ 续约成功")
+                screenshot_file = await self.take_screenshot(sid, "success")
+                return RenewalStatus.SUCCESS, "续约成功", screenshot_file, expiry, days
+
+            if data.get("status") == "error":
+                error_msg = data.get("error", "未知错误")
+                m = error_msg.lower()
+
+                if "24 час" in m or "уже продлен" in m:
+                    logger.info(f"📝 结果: 今日已续期(24小时限制)")
+                    screenshot_file = await self.take_screenshot(sid, "limited")
+                    return RenewalStatus.RATE_LIMITED, "今日已续期(24小时限制)", screenshot_file, expiry, days
+
+                if "недостаточно" in m:
+                    logger.info(f"📝 结果: 余额不足")
+                    screenshot_file = await self.take_screenshot(sid, "failed")
+                    return RenewalStatus.FAILED, "余额不足", screenshot_file, expiry, days
+
+                if "валидации" in m:
+                    logger.info(f"📝 结果: CSRF验证失败")
+                    screenshot_file = await self.take_screenshot(sid, "csrf_failed")
+                    return RenewalStatus.FAILED, "CSRF验证失败", screenshot_file, expiry, days
+
+                logger.info(f"📝 结果: {error_msg}")
+                screenshot_file = await self.take_screenshot(sid, "failed")
+                return RenewalStatus.FAILED, error_msg, screenshot_file, expiry, days
+
+            logger.info(f"📝 结果: 未知响应")
             screenshot_file = await self.take_screenshot(sid, "unknown")
-            return RenewalStatus.FAILED, str(data), screenshot_file
-            
+            return RenewalStatus.FAILED, str(data) if data else "无响应", screenshot_file, expiry, days
+
         except Exception as e:
             logger.error(f"❌ 续约服务器 {masked} 异常: {e}")
             screenshot_file = await self.take_screenshot(sid, "exception")
-            return RenewalStatus.FAILED, str(e), screenshot_file
+            return RenewalStatus.FAILED, str(e), screenshot_file, expiry, days
 
     async def extract_cookies(self) -> Optional[str]:
         try:
@@ -430,11 +411,7 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
                     logger.error(f"❌ 账号#{idx + 1} Cookie已失效")
                     error_screenshot = await client.take_screenshot("login", "expired")
                     await notifier.send_photo(
-                        f"❌ Castle-Host 账号#{idx + 1}\n\n"
-                        f"Cookie已失效，请更新\n\n"
-                        f"📝 格式:\n"
-                        f"CASTLE_COOKIES=PHPSESSID=xxx; uid=xxx,PHPSESSID=xxx; uid=xxx\n"
-                        f"(多账号用,逗号分隔)\n\n"
+                        f"❌ Castle-Host 账号#{idx + 1}\n\nCookie已失效，请更新\n\n"
                         f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                         error_screenshot
                     )
@@ -443,46 +420,37 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
             for sid in server_ids:
                 masked = mask_id(sid)
                 logger.info(f"--- 处理服务器 {masked} ---")
-                
-                # 启动服务器（如果关机）
-                started = await client.start_if_stopped(sid)
-                
-                # 获取到期时间
-                expiry = await client.get_expiry(sid)
-                d = days_left(expiry)
-                logger.info(f"📅 到期: {convert_date(expiry)} ({d}天)")
-                
-                # 续约
-                status, msg, screenshot = await client.renew(sid)
-                
-                results.append(ServerResult(sid, status, msg, expiry, d, started, screenshot))
-                await asyncio.sleep(2)
 
-            # 发送通知
+                started = await client.start_server_via_api(sid)
+
+                status, msg, screenshot, expiry, days = await client.renew(sid)
+
+                results.append(ServerResult(sid, status, msg, expiry, days, started, screenshot))
+
+                if len(server_ids) > 1 and sid != server_ids[-1]:
+                    await page.goto(f"{client.BASE}/servers", wait_until="networkidle")
+                    await page.wait_for_timeout(2000)
+
             for r in results:
                 if r.status == RenewalStatus.SUCCESS:
-                    status_icon = "✅"
-                    status_text = "续约成功"
+                    status_icon, status_text = "✅", "续约成功"
                 elif r.status == RenewalStatus.RATE_LIMITED:
-                    status_icon = "⏭️"
-                    status_text = "今日已续期"
+                    status_icon, status_text = "⏭️", "今日已续期"
                 else:
-                    status_icon = "❌"
-                    status_text = f"续约失败: {r.message}"
+                    status_icon, status_text = "❌", f"续约失败: {r.message}"
 
                 started_line = "🟢 服务器已启动\n" if r.started else ""
-                
+                masked_id = mask_id(r.server_id)
                 caption = (
                     f"🖥️ Castle-Host 自动续约\n\n"
                     f"状态: {status_icon} {status_text}\n"
                     f"账号: #{idx + 1}\n\n"
-                    f"💻 服务器: {r.server_id}\n"
+                    f"💻 服务器: {masked_id}\n"
                     f"📅 到期: {convert_date(r.expiry)}\n"
                     f"⏳ 剩余: {r.days} 天\n"
                     f"{started_line}\n"
                     f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 )
-                
                 await notifier.send_photo(caption, r.screenshot)
 
             new_cookie = await client.extract_cookies()
@@ -495,11 +463,7 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier) -> Tupl
             logger.error(f"❌ 账号#{idx + 1} 异常: {e}")
             error_screenshot = await client.take_screenshot("error", "exception")
             await notifier.send_photo(
-                f"❌ Castle-Host 账号#{idx + 1}\n\n"
-                f"异常: {e}\n\n"
-                f"📝 Cookie格式:\n"
-                f"CASTLE_COOKIES=PHPSESSID=xxx; uid=xxx,PHPSESSID=xxx; uid=xxx\n"
-                f"(多账号用,逗号分隔)\n\n"
+                f"❌ Castle-Host 账号#{idx + 1}\n\n异常: {e}\n\n"
                 f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                 error_screenshot
             )
@@ -515,8 +479,8 @@ async def main():
     logger.info("=" * 50)
 
     ensure_output_dir()
-
     config = Config.from_env()
+
     if not config.cookies_list:
         logger.error("❌ 未设置 CASTLE_COOKIES")
         return
@@ -526,8 +490,7 @@ async def main():
     notifier = Notifier(config.tg_token, config.tg_chat_id)
     github = GitHubManager(config.repo_token, config.repository)
 
-    new_cookies = []
-    changed = False
+    new_cookies, changed = [], False
 
     for i, cookie in enumerate(config.cookies_list):
         new, _ = await process_account(cookie, i, notifier)
