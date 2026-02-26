@@ -365,7 +365,7 @@ class PellaAutoRenew:
             raise Exception("❌ 缺少服务器URL")
             
         self.driver.get(self.server_url)
-        time.sleep(5)
+        time.sleep(15)
 
         self.initial_expiry_details, self.initial_expiry_value = self.extract_expiry_days(self.driver.page_source)
         logger.info(f"📅 当前过期: {self.initial_expiry_details}")
