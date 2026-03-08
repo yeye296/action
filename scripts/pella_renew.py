@@ -360,6 +360,19 @@ class PellaAutoRenew:
         self.server_status = "unknown"
         return "unknown"
     
+    def isServiceAlive(self, test_url: str = "http://pella.kisskiss.cloudns.ch", timeout: int = 5) -> bool:
+        try:
+            resp = requests.get(test_url, timeout=timeout)
+            if resp.status_code in (200, 404):
+                logger.info(f"✅ 隧道可用: {resp.status_code}")
+                return True
+            else:
+                logger.info(f"❌ 隧道不可用: {resp.status_code}")
+                return False
+        except Exception as e:
+            logger.info(f"❌ 隧道链接访问失败: {e}")
+            return False
+    
     def renew_server(self):
         if not self.server_url:
             raise Exception("❌ 缺少服务器URL")
@@ -422,14 +435,18 @@ class PellaAutoRenew:
         
         # 先检查服务器状态
         status = self.check_server_status()
-        
-        if status == "running":
+        isAlive = self.isServiceAlive()
+        if isAlive: 
             logger.info("✅ 服务器正在运行，无需重启")
-            return True, "跳过: 服务器正在运行"
+            return True
         
-        if status == "unknown":
-            logger.info("❓ 无法确定服务器状态，跳过重启")
-            return False, "跳过: 无法确定服务器状态"
+        # if status == "running":
+        #     logger.info("✅ 服务器正在运行，无需重启")
+        #     return True, "跳过: 服务器正在运行"
+        
+        # if status == "unknown":
+        #     logger.info("❓ 无法确定服务器状态，跳过重启")
+        #     return False, "跳过: 无法确定服务器状态"
         
         logger.info("🔄 服务器已停止，开始重启...")
         
