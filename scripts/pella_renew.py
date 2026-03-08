@@ -438,7 +438,7 @@ class PellaAutoRenew:
         isAlive = self.isServiceAlive()
         if isAlive: 
             logger.info("✅ 服务器正在运行，无需重启")
-            return True
+            return True, "跳过: 服务器正在运行"
         
         # if status == "running":
         #     logger.info("✅ 服务器正在运行，无需重启")
