@@ -13,7 +13,7 @@ Pella 自动续期脚本 增加重启功能（智能检测版）
     - TG_CHAT_ID=Telegram 聊天 ID
 """
 
-import os
+import os, sys
 import time
 import logging
 import re
@@ -758,10 +758,11 @@ class MultiAccountManager:
 def main():
     try:
         manager = MultiAccountManager()
-        manager.run_all()
+        all_success, _ = manager.run_all()
+        if not all_success: sys.exit(1)
     except Exception as e:
         logger.error(f"❌ 错误: {e}")
-        exit(1)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
